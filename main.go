@@ -33,13 +33,13 @@ var (
 
 var (
 	metricIsRerouting = promauto.NewGauge(prometheus.GaugeOpts{
-		Name: "fabricdirector_is_rerouting",
+		Name: "fabric_director_is_rerouting",
 		Help: "Is this node rerouting?",
 	})
 
 	metricNodeLatency = promauto.NewGaugeVec(
 		prometheus.GaugeOpts{
-			Name: "fabricdirector_node_latency",
+			Name: "fabric_director_node_latency",
 			Help: "Latency from node to node",
 		},
 		[]string{"src", "dst"},
@@ -131,7 +131,7 @@ func loadNodes(filename string) (map[string]Node, error) {
 
 func main() {
 	flag.Parse()
-	log.Infof("Starting fabricdirector %s prefix %s", version, *netPrefix)
+	log.Infof("Starting fabric-director %s prefix %s", version, *netPrefix)
 
 	// Load nodes
 	nodes, err := loadNodes(*nodesFile)

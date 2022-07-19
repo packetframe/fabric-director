@@ -1,5 +1,5 @@
 builds:
-  - id: fabricdirector
+  - id: fabric-director
     goos:
       - linux
     goarch:
@@ -13,11 +13,11 @@ changelog:
       - "^test:"
 
 nfpms:
-  - id: fabricdirector
-    package_name: fabricdirector
-    file_name_template: "edged_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+  - id: fabric-director
+    package_name: fabric-director
+    file_name_template: "fabric-director_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
     vendor: Packetframe
-    homepage: https://github.com/packetframe/fabricdirector
+    homepage: https://github.com/packetframe/fabric-director
     maintainer: Nate Sales <nate@packetframe.com>
     description: Packetframe Fabric Director
     license: GNU GPL-3.0

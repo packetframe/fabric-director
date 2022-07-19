@@ -1,4 +1,4 @@
-module github.com/packetframe/fabricdirector
+module github.com/packetframe/fabric-director
 
 go 1.18
 
