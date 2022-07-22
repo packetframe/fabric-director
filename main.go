@@ -176,7 +176,7 @@ func main() {
 	for range ticker.C {
 		for name, node := range nodes {
 			// Ping node
-			latency, err := icmpLatency(fmt.Sprintf("%s%d", *netPrefix, *localNode), node.IP)
+			latency, err := icmpLatency(fmt.Sprintf("%s%d", *netPrefix, *localNode), fmt.Sprintf("%s%d", *netPrefix, node.ID))
 			if err != nil {
 				log.Warnf("Error pinging %s: %s", node.IP, err)
 			}
