@@ -35,6 +35,7 @@ type Config struct {
 	Prefix6          string          `yaml:"prefix6"`
 	PingInterval     time.Duration   `yaml:"ping-interval"`
 	LatencyThreshold time.Duration   `yaml:"latency-threshold"`
+	LossThreshold    float64         `yaml:"loss-threshold"`
 	Listen           string          `yaml:"listen"`
 	Prefixes         []string        `yaml:"prefixes"`
 	Nodes            map[string]Node `yaml:"nodes"`
@@ -219,11 +220,11 @@ func teardownGRE() error {
 }
 
 // icmpLatency uses ICMP pings to measure the latency of a remote host
-func icmpLatency(src, dst string) (time.Duration, error) {
+func icmpLatency(src, dst string) (time.Duration, float64, error) {
 	log.Debugf("Pinging %s from %s", dst, src)
 	pinger, err := ping.NewPinger(dst)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	pinger.Source = src
 	pinger.Count = 3
@@ -231,9 +232,10 @@ func icmpLatency(src, dst string) (time.Duration, error) {
 	pinger.SetPrivileged(false)
 	err = pinger.Run()
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
-	return pinger.Statistics().AvgRtt, nil
+	stats := pinger.Statistics()
+	return stats.AvgRtt, stats.PacketLoss, nil
 }
 
 func main() {
@@ -355,11 +357,11 @@ func main() {
 			log.Debugf("Pinging %s %+v", name, node)
 
 			// Ping node
-			latency, err := icmpLatency(internalIP(config.Prefix4, config.LocalID, 0), internalIP(config.Prefix4, node.ID, 0))
+			latency, loss, err := icmpLatency(internalIP(config.Prefix4, config.LocalID, 0), internalIP(config.Prefix4, node.ID, 0))
 			if err != nil {
 				log.Warnf("Error pinging %s: %s", name, err)
 			}
-			if latency <= config.LatencyThreshold {
+			if latency <= config.LatencyThreshold && loss < config.LossThreshold {
 				node.Latency = latency
 				log.Debugf("Adding candidate node %+v", node)
 				candidateNodes[name] = node
