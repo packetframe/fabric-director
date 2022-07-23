@@ -81,8 +81,13 @@ func parseCIDR(cidr string) (net.IPNet, error) {
 }
 
 // internalIP returns the GRE internal IP of a node
-func internalIP(prefix string, node, mask uint8) string {
-	out := fmt.Sprintf("%s%d", prefix, node)
+func internalIP(prefix string, octet3, octet4, mask uint8) string {
+	var out string
+	if strings.Contains(prefix, ".") {
+		out = fmt.Sprintf("%s.%d.%d", prefix, octet3, octet4)
+	} else {
+		out = fmt.Sprintf("%s:%d:%d", prefix, octet3, octet4)
+	}
 	if mask != 0 {
 		out += fmt.Sprintf("/%d", mask)
 	}
@@ -292,8 +297,8 @@ func main() {
 			"fd-"+name,
 			localNodeIP,
 			node.IP,
-			internalIP(config.Prefix4, config.LocalID, 24),
-			internalIP(config.Prefix6, config.LocalID, 112),
+			internalIP(config.Prefix4, node.ID, config.LocalID, 24),
+			internalIP(config.Prefix6, node.ID, config.LocalID, 112),
 		)
 		if err != nil {
 			log.Warn(err)
@@ -317,8 +322,8 @@ func main() {
 			if err := setReroute(
 				true,
 				config.Prefixes,
-				internalIP(config.Prefix4, node.ID, 0),
-				internalIP(config.Prefix6, node.ID, 0),
+				internalIP(config.Prefix4, config.LocalID, node.ID, 0),
+				internalIP(config.Prefix6, config.LocalID, node.ID, 0),
 			); err != nil {
 				_, _ = fmt.Fprintf(w, "Error rerouting to %s: %s\n", to, err)
 				return
@@ -357,7 +362,7 @@ func main() {
 			log.Debugf("Pinging %s %+v", name, node)
 
 			// Ping node
-			latency, loss, err := icmpLatency(internalIP(config.Prefix4, config.LocalID, 0), internalIP(config.Prefix4, node.ID, 0))
+			latency, loss, err := icmpLatency(internalIP(config.Prefix4, node.ID, config.LocalID, 0), internalIP(config.Prefix4, config.LocalID, node.ID, 0))
 			if err != nil {
 				log.Warnf("Error pinging %s: %s", name, err)
 			}
