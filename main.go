@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"strings"
 	"time"
 
@@ -21,20 +22,33 @@ import (
 var version = "dev"
 
 var (
-	localNode        = flag.Uint("node", 10, "Local node ID")
-	netPrefix        = flag.String("prefix", "172.17.104.", "/24 network prefix without last octet")
-	nodesFile        = flag.String("nodes", "nodes.yml", "Node definition file")
-	localIP          = flag.String("ip", "192.0.2.100", "Local IP for GRE tunnels")
-	pingInterval     = flag.Duration("ping", 1*time.Second, "Time between ICMP pings")
-	latencyThreshold = flag.Duration("threshold", 100*time.Millisecond, "Latency threshold")
-	down             = flag.Bool("down", false, "Teardown tunnels and exit")
-	metricsListen    = flag.String("metrics-listen", ":9090", "Prometheus metrics listen address")
+	configFile = flag.String("c", "config.yml", "Configuration file")
+	down       = flag.Bool("d", false, "Teardown tunnels and exit")
+	verbose    = flag.Bool("v", false, "Verbose output")
 )
+
+var candidateNodes = map[string]Node{} // Node name to node
+
+type Config struct {
+	LocalID          uint8           `yaml:"local-id"`
+	Prefix4          string          `yaml:"prefix4"`
+	Prefix6          string          `yaml:"prefix6"`
+	PingInterval     time.Duration   `yaml:"ping-interval"`
+	LatencyThreshold time.Duration   `yaml:"latency-threshold"`
+	Listen           string          `yaml:"listen"`
+	Prefixes         []string        `yaml:"prefixes"`
+	Nodes            map[string]Node `yaml:"nodes"`
+}
 
 var (
 	metricIsRerouting = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "fabric_director_is_rerouting",
 		Help: "Is this node rerouting?",
+	})
+
+	metricCandidateNodes = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "fabric_director_candidate_nodes",
+		Help: "Number of candidate nodes",
 	})
 
 	metricNodeLatency = promauto.NewGaugeVec(
@@ -48,12 +62,36 @@ var (
 
 // Node represents an edge node
 type Node struct {
-	ID uint8  `yaml:"id"`
-	IP string `yaml:"ip"`
+	ID      uint8  `yaml:"id"`
+	IP      string `yaml:"ip"`
+	Latency time.Duration
 }
 
-// addGre adds a GRE tunnel
-func addGre(name, local, remote, ip string) error {
+// parseCIDR parses a CIDR string into an IPNet preserving the last octet
+func parseCIDR(cidr string) (net.IPNet, error) {
+	ip, ipNet, err := net.ParseCIDR(cidr)
+	if err != nil {
+		return net.IPNet{}, err
+	}
+	full := net.IPNet{}
+	full.IP = ip
+	full.Mask = ipNet.Mask
+	return full, nil
+}
+
+// internalIP returns the GRE internal IP of a node
+func internalIP(prefix string, node, mask uint8) string {
+	out := fmt.Sprintf("%s%d", prefix, node)
+	if mask != 0 {
+		out += fmt.Sprintf("/%d", mask)
+	}
+	return out
+}
+
+// addGRE adds a GRE tunnel and returns the interface index
+func addGRE(name, local, remote, ip4, ip6 string) (int, error) {
+	log.Debugf("Adding GRE tunnel %s from %s to %s and adding %s and %s", name, local, remote, ip4, ip6)
+
 	// Create GRE interface
 	la := netlink.NewLinkAttrs()
 	la.Name = name
@@ -64,25 +102,107 @@ func addGre(name, local, remote, ip string) error {
 		LinkAttrs: la,
 	}
 	if err := netlink.LinkAdd(gre); err != nil {
-		return fmt.Errorf("error adding GRE tunnel %s: %s", name, err)
+		return -1, fmt.Errorf("error adding GRE tunnel %s: %s", name, err)
 	}
 
 	// Add IP address to interface
-	_, ipNet, err := net.ParseCIDR(ip)
+	ipNet4, err := parseCIDR(ip4)
 	if err != nil {
-		return fmt.Errorf("error parsing IP %s for GRE interface %s: %s", ip, name, err)
+		return -1, fmt.Errorf("error parsing IPv4 %s for GRE interface %s: %s", ip4, name, err)
 	}
-	if err := netlink.AddrAdd(gre, &netlink.Addr{IPNet: ipNet}); err != nil {
-		return fmt.Errorf("error adding IP %s to GRE interface %s: %s", ip, name, err)
+	ipNet6, err := parseCIDR(ip6)
+	if err != nil {
+		return -1, fmt.Errorf("error parsing IPv6 %s for GRE interface %s: %s", ip6, name, err)
+	}
+	if err := netlink.AddrAdd(gre, &netlink.Addr{IPNet: &ipNet4}); err != nil {
+		return -1, fmt.Errorf("error adding IPv4 %s to GRE interface %s: %s", ip4, name, err)
+	}
+	if err := netlink.AddrAdd(gre, &netlink.Addr{IPNet: &ipNet6}); err != nil {
+		return -1, fmt.Errorf("error adding IPv6 %s to GRE interface %s: %s", ip6, name, err)
 	}
 	if err := netlink.LinkSetUp(gre); err != nil {
-		return fmt.Errorf("error bringing up GRE interface %s: %s", name, err)
+		return -1, fmt.Errorf("error bringing up GRE interface %s: %s", name, err)
+	}
+	return gre.Attrs().Index, nil
+}
+
+// addRoute adds a static route from a prefix to an interface
+func addRoute(prefix, nexthop4, nexthop6 string) error {
+	_, ipNet, err := net.ParseCIDR(prefix)
+	if err != nil {
+		return err
+	}
+
+	var nexthop string
+	if ipNet.IP.To4() != nil {
+		nexthop = nexthop4
+	} else {
+		nexthop = nexthop6
+	}
+
+	log.Debugf("Adding route %s via %s", prefix, nexthop)
+	route := &netlink.Route{
+		Dst:      ipNet,
+		Gw:       net.ParseIP(nexthop),
+		Priority: 1,
+	}
+	return netlink.RouteAdd(route)
+}
+
+// setPFNet controls the pf-net service state
+func setPFNet(state bool) error {
+	if state {
+		return exec.Command("/opt/packetframe/net.sh").Run()
+	} else {
+		return netlink.LinkDel(&netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: "local"}})
+	}
+}
+
+// setReroute controls the rerouting state
+func setReroute(reroute bool, prefixes []string, nexthop4, nexthop6 string) error {
+	if reroute {
+		metricIsRerouting.Set(1)
+		if err := setPFNet(false); err != nil {
+			return err
+		}
+		for _, prefix := range prefixes {
+			if err := addRoute(prefix, nexthop4, nexthop6); err != nil {
+				return err
+			}
+		}
+	} else {
+		for _, prefix := range prefixes {
+			_, ipNet, err := net.ParseCIDR(prefix)
+			if err != nil {
+				return err
+			}
+			if err := netlink.RouteDel(&netlink.Route{Dst: ipNet, Scope: netlink.SCOPE_UNIVERSE}); err != nil {
+				return err
+			}
+		}
+		if err := setPFNet(true); err != nil {
+			return err
+		}
+		metricIsRerouting.Set(0)
 	}
 	return nil
 }
 
-// teardown deletes all GRE interfaces
-func teardown() error {
+// closestNode returns the node with the lowest latency
+func closestNode() (*Node, string) {
+	var closest *Node
+	var closestName string
+	for name, node := range candidateNodes {
+		if closest == nil || node.Latency < closest.Latency {
+			closest = &node
+			closestName = name
+		}
+	}
+	return closest, closestName
+}
+
+// teardownGRE deletes all GRE interfaces
+func teardownGRE() error {
 	links, err := netlink.LinkList()
 	if err != nil {
 		return err
@@ -100,6 +220,7 @@ func teardown() error {
 
 // icmpLatency uses ICMP pings to measure the latency of a remote host
 func icmpLatency(src, dst string) (time.Duration, error) {
+	log.Debugf("Pinging %s from %s", dst, src)
 	pinger, err := ping.NewPinger(dst)
 	if err != nil {
 		return 0, err
@@ -107,6 +228,7 @@ func icmpLatency(src, dst string) (time.Duration, error) {
 	pinger.Source = src
 	pinger.Count = 3
 	pinger.Timeout = 500 * time.Millisecond
+	pinger.SetPrivileged(false)
 	err = pinger.Run()
 	if err != nil {
 		return 0, err
@@ -114,72 +236,138 @@ func icmpLatency(src, dst string) (time.Duration, error) {
 	return pinger.Statistics().AvgRtt, nil
 }
 
-// loadNodes loads the nodes from a YAML file
-func loadNodes(filename string) (map[string]Node, error) {
-	yamlBytes, err := os.ReadFile(filename)
-	if err != nil {
-		return nil, err
-	}
-
-	var nodes map[string]Node
-	if err = yaml.Unmarshal(yamlBytes, &nodes); err != nil {
-		return nil, err
-	}
-
-	return nodes, nil
-}
-
 func main() {
 	flag.Parse()
-	log.Infof("Starting fabric-director %s prefix %s", version, *netPrefix)
-
-	// Load nodes
-	nodes, err := loadNodes(*nodesFile)
-	if err != nil {
-		log.Fatalf("Error loading nodes: %s", err)
+	if *verbose {
+		log.SetLevel(log.DebugLevel)
 	}
-	log.Infof("Loaded %d nodes from %s", len(nodes), *nodesFile)
+	log.Infof("Starting fabric-director %s", version)
 
+	// Load configuration
+	yamlBytes, err := os.ReadFile(*configFile)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	var config Config
+	if err = yaml.Unmarshal(yamlBytes, &config); err != nil {
+		log.Fatal(err)
+	}
+
+	log.Infof("Loaded %d nodes from %s", len(config.Nodes), *configFile)
+
+	if err := teardownGRE(); err != nil {
+		log.Errorf("Error tearing down interfaces: %s", err)
+	}
 	if *down {
-		log.Info("Teardown requested")
-		if err := teardown(); err != nil {
-			log.Errorf("Error tearing down interfaces: %s", err)
-		}
 		log.Info("Teardown complete")
 		os.Exit(0)
 	}
 
-	// Create GRE tunnels
-	var localNodeName string
-	for name, node := range nodes {
-		// Skip local node
-		if uint(node.ID) == *localNode {
+	// Find local node from nodes file
+	var localNodeName, localNodeIP string
+	for name, node := range config.Nodes {
+		if node.ID == config.LocalID {
 			localNodeName = name
+			localNodeIP = node.IP
+			log.Infof("Found local node %s (%s)", name, localNodeIP)
+			break
+		}
+	}
+	if localNodeIP == "" || localNodeName == "" {
+		log.Fatalf("Could not find local node %d in %s", config.LocalID, *configFile)
+	}
+
+	// Create GRE tunnels
+	for name, node := range config.Nodes {
+		// Skip local node
+		if node.ID == config.LocalID {
 			continue
 		}
 
 		log.Infof("Adding GRE tunnel to %s", name)
-		if err := addGre("fd-"+name, *localIP, node.IP, fmt.Sprintf("%s%d/32", *netPrefix, node.ID)); err != nil {
+		_, err := addGRE(
+			"fd-"+name,
+			localNodeIP,
+			node.IP,
+			internalIP(config.Prefix4, config.LocalID, 24),
+			internalIP(config.Prefix6, config.LocalID, 112),
+		)
+		if err != nil {
 			log.Warn(err)
 		}
 	}
 
-	// Start Prometheus metrics server
+	// Start API server
 	go func() {
-		log.Infof("Starting Prometheus metrics server on %s", *metricsListen)
+		log.Infof("Starting API on %s", config.Listen)
+
+		http.HandleFunc("/reroute", func(w http.ResponseWriter, r *http.Request) {
+			var node *Node
+			to := r.URL.Query().Get("to")
+			if to == "" {
+				node, to = closestNode()
+			} else {
+				n := config.Nodes[to]
+				node = &n
+			}
+			log.Debugf("Rerouting to %s %+v", to, node)
+			if err := setReroute(
+				true,
+				config.Prefixes,
+				internalIP(config.Prefix4, node.ID, 0),
+				internalIP(config.Prefix6, node.ID, 0),
+			); err != nil {
+				_, _ = fmt.Fprintf(w, "Error rerouting to %s: %s\n", to, err)
+				return
+			}
+			_, _ = fmt.Fprintf(w, "Rerouting to %s\n", to)
+			return
+		})
+
+		http.HandleFunc("/noreroute", func(w http.ResponseWriter, r *http.Request) {
+			if err := setReroute(false, config.Prefixes, "", ""); err != nil {
+				_, _ = fmt.Fprintf(w, "Error disabling reroute: %s\n", err)
+				return
+			}
+			_, _ = fmt.Fprintf(w, "Reroute disabled\n")
+		})
+
+		http.HandleFunc("/candidates", func(w http.ResponseWriter, r *http.Request) {
+			for name, node := range candidateNodes {
+				_, _ = fmt.Fprintf(w, "%s %+v\n", name, node)
+			}
+		})
+
 		http.Handle("/metrics", promhttp.Handler())
-		log.Fatal(http.ListenAndServe(*metricsListen, nil))
+		log.Fatal(http.ListenAndServe(config.Listen, nil))
 	}()
 
 	// Start ICMP pinger in a new ticker
-	ticker := time.NewTicker(*pingInterval)
+	ticker := time.NewTicker(config.PingInterval)
 	for range ticker.C {
-		for name, node := range nodes {
-			// Ping node
-			latency, err := icmpLatency(fmt.Sprintf("%s%d", *netPrefix, *localNode), fmt.Sprintf("%s%d", *netPrefix, node.ID))
-			if err != nil {
-				log.Warnf("Error pinging %s: %s", node.IP, err)
+		for name, node := range config.Nodes {
+			// Skip local node
+			if node.ID == config.LocalID {
+				continue
 			}
+
+			log.Debugf("Pinging %s %+v", name, node)
+
+			// Ping node
+			latency, err := icmpLatency(internalIP(config.Prefix4, config.LocalID, 0), internalIP(config.Prefix4, node.ID, 0))
+			if err != nil {
+				log.Warnf("Error pinging %s: %s", name, err)
+			}
+			if latency <= config.LatencyThreshold {
+				node.Latency = latency
+				log.Debugf("Adding candidate node %+v", node)
+				candidateNodes[name] = node
+			} else {
+				delete(candidateNodes, name)
+			}
+
+			metricCandidateNodes.Set(float64(len(candidateNodes)))
 			metricNodeLatency.With(prometheus.Labels{
 				"src": localNodeName,
 				"dst": name,
